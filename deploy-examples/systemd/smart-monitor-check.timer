@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily SMART status check
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+AccuracySec=1min
+Unit=smart-monitor@check.service
+
+[Install]
+WantedBy=timers.target

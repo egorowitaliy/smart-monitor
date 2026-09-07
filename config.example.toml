@@ -1,0 +1,90 @@
+[general]
+# Если не задано, используется короткое имя текущего сервера.
+hostname = ""
+
+# Каналы для автоматических уведомлений:
+# telegram, matrix, max, telegram-matrix, telegram-max, matrix-max, all, none
+default_destination = "none"
+
+# Обычно smartctl находится автоматически. Укажите путь только при необходимости.
+smartctl_path = ""
+
+lock_file = "/run/smart-monitor.lock"
+lock_wait_seconds = 5
+smartctl_command_timeout_seconds = 30
+poll_interval_seconds = 20
+poll_error_limit = 3
+selftest_result_settle_seconds = 30
+abort_verify_seconds = 30
+
+# Для ATA время long/short берётся из самого накопителя и дополняется запасом.
+ata_short_grace_minutes = 10
+ata_long_grace_minutes = 60
+
+# Для NVMe smartctl не всегда сообщает расчётное время теста.
+nvme_short_timeout_minutes = 30
+nvme_long_timeout_minutes = 360
+
+# Для системного диска лучше использовать стабильный путь /dev/disk/by-id/...
+[[disks]]
+path = "/dev/disk/by-id/ata-WDC_EXAMPLE_DISK_1"
+label = "Диск данных"
+kind = "auto"
+temperature_warning = 50
+temperature_critical = 60
+
+# Для некоторых USB/SATA-мостов smartctl требует -d sat.
+[[disks]]
+path = "/dev/disk/by-id/usb-WD_EXAMPLE_DISK_2-0:0"
+label = "Внешний диск"
+kind = "auto"
+device_type = "sat"
+temperature_warning = 50
+temperature_critical = 60
+
+[[disks]]
+path = "/dev/disk/by-id/nvme-EXAMPLE_NVME_1"
+label = "Системный SSD"
+kind = "auto"
+temperature_warning = 70
+temperature_critical = 80
+wear_warning_percent = 90
+wear_critical_percent = 100
+
+[telegram]
+enabled = false
+chat_id = ""
+# Можно указать token прямо здесь либо через переменную окружения.
+token = ""
+token_env = "SMART_MONITOR_TELEGRAM_TOKEN"
+proxy_enabled = false
+proxy_url = "http://127.0.0.1:3128"
+proxy_username = ""
+proxy_password = ""
+proxy_password_env = "SMART_MONITOR_TELEGRAM_PROXY_PASSWORD"
+
+[matrix]
+enabled = false
+url = "https://matrix.example.org"
+room_id = "!roomid:example.org"
+token = ""
+token_env = "SMART_MONITOR_MATRIX_TOKEN"
+
+[max]
+enabled = false
+api_host = "platform-api2.max.ru"
+api_port = 443
+chat_id = ""
+bot_token = ""
+bot_token_env = "SMART_MONITOR_MAX_TOKEN"
+
+# Необязательное резервное SMS через совместимый Huawei HiLink API.
+# Блокировка должна быть общей со всеми другими программами,
+# которые обращаются к тому же модему.
+[sms_fallback]
+enabled = false
+modem_url = "http://192.168.8.1"
+phone = "+70000000000"
+lock_file = "/run/lock/huawei-modem-api.lock"
+lock_wait_seconds = 30
+cleanup_sent_message = true

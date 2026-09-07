@@ -1,0 +1,19 @@
+[Unit]
+Description=SMART monitor (%i)
+After=local-fs.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/smart-monitor %i --wait-lock --config /etc/smart-monitor/config.toml
+SuccessExitStatus=1 4
+EnvironmentFile=-/etc/smart-monitor/secrets.env
+User=root
+Group=root
+UMask=0077
+TimeoutStartSec=infinity
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
