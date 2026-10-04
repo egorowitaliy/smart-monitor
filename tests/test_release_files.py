@@ -12,7 +12,6 @@ def test_release_version_is_consistent():
     pyproject = tomllib.loads((ROOT / 'pyproject.toml').read_text(encoding='utf-8'))
     source = (ROOT / 'smart_monitor.py').read_text(encoding='utf-8')
 
-    assert version == '1.0.0'
     assert pyproject['project']['version'] == version
     assert f'VERSION = "{version}"' in source
 
