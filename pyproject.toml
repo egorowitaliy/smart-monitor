@@ -1,6 +1,6 @@
 [project]
 name = "smart-monitor"
-version = "1.0.0"
+version = "1.0.1"
 description = "Монитор SMART и контроль самотестов накопителей для Linux-серверов"
 requires-python = ">=3.11"
 license = {text = "MIT"}

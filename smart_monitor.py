@@ -29,7 +29,7 @@ from typing import Any, BinaryIO
 
 
 DEFAULT_SMARTCTL = "/usr/sbin/smartctl"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 DEFAULT_CONFIG = "/etc/smart-monitor/config.toml"
 LOG = logging.getLogger("smart-monitor")
 
@@ -672,18 +672,35 @@ def apply_latest_selftest_health(
         if not isinstance(result, dict):
             return
         passed = result.get("passed")
+        value = get_int(result.get("value"))
         description = str(result.get("string", "")).strip()
-        if passed is True or passed is None:
+        lowered = description.lower()
+
+        # В SMART self-test log поле "passed" присутствует не всегда.
+        # Например, smartctl 7.4 для "Aborted by host" возвращает только
+        # value/string/remaining_percent. Поэтому учитываем ATA status code:
+        # high nibble 0 = успешно, 1 = aborted by host, 2 = interrupted/reset.
+        status_code = ((value >> 4) & 0x0F) if value is not None else None
+
+        if (
+            passed is True
+            or status_code == 0
+            or "completed without error" in lowered
+        ):
             return
 
-        lowered = description.lower()
-        if "aborted by host" in lowered or "interrupted" in lowered:
+        if (
+            status_code in (1, 2)
+            or "aborted by host" in lowered
+            or "interrupted" in lowered
+            or "host reset" in lowered
+        ):
             _add_issue(
                 warning,
                 "Последний самотест ATA был прерван"
                 + (f": {description}" if description else ""),
             )
-        else:
+        elif passed is False or status_code is not None:
             _add_issue(
                 critical,
                 "Последний самотест ATA завершился с ошибкой"
@@ -1074,10 +1091,17 @@ def evaluate_selftest_result(
             return
 
         passed = status.get("passed")
+        value = get_int(status.get("value"))
         description = str(status.get("string", "неизвестный результат")).strip()
+        lowered = description.lower()
+        status_code = ((value >> 4) & 0x0F) if value is not None else None
         result.completed = True
 
-        if passed is True:
+        if (
+            passed is True
+            or status_code == 0
+            or "completed without error" in lowered
+        ):
             result.outcome = SelfTestOutcome.PASSED
             result.detail = "успешно"
         else:
@@ -1454,6 +1478,19 @@ def format_value(value: int | None) -> str:
     return "—" if value is None else str(value)
 
 
+def selftest_severity(result: SelfTestResult) -> int:
+    if result.outcome == SelfTestOutcome.PASSED:
+        return 0
+
+    if result.outcome in {
+        SelfTestOutcome.TIMEOUT_ABORTED,
+        SelfTestOutcome.BUSY,
+    }:
+        return 1
+
+    return 2
+
+
 def selftest_line(result: SelfTestResult) -> str:
     name = "Короткий тест" if result.test_type == "short" else "Длительный тест"
 
@@ -1486,12 +1523,25 @@ def build_report(
 
     for status in statuses:
         lines.append("")
-        lines.append(f"{status_marker(status.severity)} {status.disk.label}")
 
-        if test_results is not None:
-            result = test_results.get(status.disk.path)
-            if result is not None:
-                lines.append(selftest_line(result))
+        result = (
+            test_results.get(status.disk.path)
+            if test_results is not None
+            else None
+        )
+        effective_severity = status.severity
+        if result is not None:
+            effective_severity = max(
+                effective_severity,
+                selftest_severity(result),
+            )
+
+        lines.append(
+            f"{status_marker(effective_severity)} {status.disk.label}"
+        )
+
+        if result is not None:
+            lines.append(selftest_line(result))
 
         metrics = status.metrics
         lines.append(f"Температура: {format_value(status.temperature)}°C")
