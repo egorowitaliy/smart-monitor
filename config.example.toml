@@ -10,6 +10,9 @@ default_destination = "none"
 smartctl_path = ""
 
 lock_file = "/run/smart-monitor.lock"
+
+# Persistent-состояние для событий self-test, созданных самим монитором.
+state_file = "/var/lib/smart-monitor/state.json"
 lock_wait_seconds = 5
 smartctl_command_timeout_seconds = 30
 poll_interval_seconds = 20

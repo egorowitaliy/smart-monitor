@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -29,8 +30,9 @@ from typing import Any, BinaryIO
 
 
 DEFAULT_SMARTCTL = "/usr/sbin/smartctl"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 DEFAULT_CONFIG = "/etc/smart-monitor/config.toml"
+DEFAULT_STATE_FILE = "/var/lib/smart-monitor/state.json"
 LOG = logging.getLogger("smart-monitor")
 
 EXIT_OK = 0
@@ -660,12 +662,18 @@ def apply_latest_selftest_health(
     data: dict[str, Any],
     critical: list[str],
     warning: list[str],
+    general: dict[str, Any] | None = None,
 ) -> None:
     table = selftest_table(status.disk, data)
     if not table:
         return
 
     latest = table[0]
+
+    owned_timeout_abort = (
+        general is not None
+        and owned_timeout_abort_matches(status.disk, data, general)
+    )
 
     if status.disk.kind == "ata":
         result = latest.get("status", {})
@@ -695,6 +703,14 @@ def apply_latest_selftest_health(
             or "interrupted" in lowered
             or "host reset" in lowered
         ):
+            if owned_timeout_abort:
+                LOG.debug(
+                    "%s: последняя запись self-test — собственный "
+                    "контролируемый timeout-abort; предупреждение подавлено",
+                    status.disk.label,
+                )
+                return
+
             _add_issue(
                 warning,
                 "Последний самотест ATA был прерван"
@@ -748,7 +764,11 @@ def apply_temperature_thresholds(
         )
 
 
-def read_ata_status(data: dict[str, Any], status: DiskStatus) -> None:
+def read_ata_status(
+    data: dict[str, Any],
+    status: DiskStatus,
+    general: dict[str, Any] | None = None,
+) -> None:
     status.metrics = {
         "reallocated": get_ata_raw_value(data, 5),
         "pending": get_ata_raw_value(data, 197),
@@ -783,12 +803,22 @@ def read_ata_status(data: dict[str, Any], status: DiskStatus) -> None:
         status.operational_error = True
         _add_issue(critical, "SMART attributes отсутствуют в ответе smartctl")
 
-    apply_latest_selftest_health(status, data, critical, warning)
+    apply_latest_selftest_health(
+        status,
+        data,
+        critical,
+        warning,
+        general,
+    )
     apply_temperature_thresholds(status, critical, warning)
     apply_health_result(status, critical, warning)
 
 
-def read_nvme_status(data: dict[str, Any], status: DiskStatus) -> None:
+def read_nvme_status(
+    data: dict[str, Any],
+    status: DiskStatus,
+    general: dict[str, Any] | None = None,
+) -> None:
     health = data.get("nvme_smart_health_information_log")
     critical, warning = smartctl_health_bits(status.smartctl_exit_status)
 
@@ -847,7 +877,13 @@ def read_nvme_status(data: dict[str, Any], status: DiskStatus) -> None:
             f"{wear_warning}%",
         )
 
-    apply_latest_selftest_health(status, data, critical, warning)
+    apply_latest_selftest_health(
+        status,
+        data,
+        critical,
+        warning,
+        general,
+    )
     apply_temperature_thresholds(status, critical, warning)
     apply_health_result(status, critical, warning)
 
@@ -918,9 +954,9 @@ def read_disk_status(disk: Disk, general: dict[str, Any]) -> DiskStatus:
         )
 
     if disk.kind == "ata":
-        read_ata_status(data, status)
+        read_ata_status(data, status, general)
     else:
-        read_nvme_status(data, status)
+        read_nvme_status(data, status, general)
 
     if command_error_bits:
         status.severity = 2
@@ -957,6 +993,295 @@ def selftest_log_signature(disk: Disk, data: dict[str, Any]) -> str:
     # первую запись. При добавлении нового результата сдвигается вся таблица.
     table = selftest_table(disk, data)
     return json.dumps(table, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+
+
+def runtime_state_path(general: dict[str, Any]) -> Path:
+    raw = str(general.get("state_file", DEFAULT_STATE_FILE)).strip()
+    return Path(raw or DEFAULT_STATE_FILE)
+
+
+def empty_runtime_state() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "owned_timeout_aborts": {},
+    }
+
+
+def load_runtime_state(general: dict[str, Any]) -> dict[str, Any]:
+    path = runtime_state_path(general)
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return empty_runtime_state()
+    except (OSError, ValueError) as exc:
+        # State нужен только для подавления уже известного собственного
+        # abort. При любой проблеме чтения ничего не подавляем.
+        LOG.warning("Не удалось прочитать state %s: %s", path, exc)
+        return empty_runtime_state()
+
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        LOG.warning(
+            "Некорректный формат state %s; состояние игнорируется",
+            path,
+        )
+        return empty_runtime_state()
+
+    events = payload.get("owned_timeout_aborts")
+    if not isinstance(events, dict):
+        LOG.warning(
+            "Некорректный owned_timeout_aborts в %s",
+            path,
+        )
+        return empty_runtime_state()
+
+    return payload
+
+
+def save_runtime_state(
+    general: dict[str, Any],
+    state: dict[str, Any],
+) -> bool:
+    path = runtime_state_path(general)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        text = json.dumps(
+            state,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+        ) + "\n"
+
+        tmp.write_text(text, encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        return True
+
+    except OSError as exc:
+        LOG.warning(
+            "Не удалось сохранить state %s: %s",
+            path,
+            exc,
+        )
+
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        return False
+
+
+def selftest_log_digest(
+    disk: Disk,
+    data: dict[str, Any],
+) -> str:
+    signature = selftest_log_signature(disk, data)
+
+    return hashlib.sha256(
+        signature.encode("utf-8")
+    ).hexdigest()
+
+
+def latest_ata_selftest_is_host_abort(
+    disk: Disk,
+    data: dict[str, Any],
+) -> bool:
+    if disk.kind != "ata":
+        return False
+
+    table = selftest_table(disk, data)
+    if not table:
+        return False
+
+    latest = table[0]
+    status = latest.get("status", {})
+
+    if not isinstance(status, dict):
+        return False
+
+    value = get_int(status.get("value"))
+    description = str(
+        status.get("string", "")
+    ).strip().lower()
+
+    status_code = (
+        (value >> 4) & 0x0F
+        if value is not None
+        else None
+    )
+
+    return (
+        status_code in (1, 2)
+        or "aborted by host" in description
+        or "interrupted" in description
+        or "host reset" in description
+    )
+
+
+def record_owned_timeout_abort(
+    disk: Disk,
+    data: dict[str, Any],
+    general: dict[str, Any],
+    test_type: str,
+) -> bool:
+    if not latest_ata_selftest_is_host_abort(disk, data):
+        return False
+
+    state = load_runtime_state(general)
+    events = state.setdefault(
+        "owned_timeout_aborts",
+        {},
+    )
+
+    if not isinstance(events, dict):
+        events = {}
+        state["owned_timeout_aborts"] = events
+
+    events[disk.path] = {
+        "event": "timeout-aborted",
+        "signature_sha256": selftest_log_digest(
+            disk,
+            data,
+        ),
+        "test_type": test_type,
+        "recorded_at": int(time.time()),
+    }
+
+    if not save_runtime_state(general, state):
+        return False
+
+    LOG.info(
+        "%s: сохранена сигнатура собственного timeout-abort",
+        disk.label,
+    )
+
+    return True
+
+
+def owned_timeout_abort_matches(
+    disk: Disk,
+    data: dict[str, Any],
+    general: dict[str, Any],
+) -> bool:
+    if disk.kind != "ata":
+        return False
+
+    state = load_runtime_state(general)
+    events = state.get(
+        "owned_timeout_aborts",
+        {},
+    )
+
+    if not isinstance(events, dict):
+        return False
+
+    marker = events.get(disk.path)
+
+    if not isinstance(marker, dict):
+        return False
+
+    expected = marker.get("signature_sha256")
+
+    if not isinstance(expected, str) or not expected:
+        events.pop(disk.path, None)
+        save_runtime_state(general, state)
+        return False
+
+    current = selftest_log_digest(disk, data)
+
+    if current == expected:
+        return marker.get("event") == "timeout-aborted"
+
+    # Любая новая запись self-test меняет сигнатуру всей таблицы.
+    # Старый marker больше не относится к текущему событию.
+    events.pop(disk.path, None)
+    save_runtime_state(general, state)
+
+    LOG.info(
+        "%s: журнал self-test изменился; "
+        "старый timeout-abort marker удалён",
+        disk.label,
+    )
+
+    return False
+
+
+def remember_owned_timeout_abort(
+    active: ActiveTest,
+    general: dict[str, Any],
+) -> bool:
+    disk = active.result.disk
+
+    if disk.kind != "ata":
+        return False
+
+    settle_seconds = _get_int(
+        general,
+        "selftest_result_settle_seconds",
+        30,
+        1,
+    )
+
+    deadline = time.monotonic() + settle_seconds
+    last_error = ""
+
+    while True:
+        try:
+            data = read_selftest_log(disk, general)
+            signature = selftest_log_signature(
+                disk,
+                data,
+            )
+
+            if signature != active.before_signature:
+                if latest_ata_selftest_is_host_abort(
+                    disk,
+                    data,
+                ):
+                    return record_owned_timeout_abort(
+                        disk,
+                        data,
+                        general,
+                        active.result.test_type,
+                    )
+
+                LOG.warning(
+                    "%s: после остановки self-test журнал "
+                    "изменился, но новая запись не является "
+                    "host-abort; marker не сохранён",
+                    disk.label,
+                )
+                return False
+
+        except MonitorError as exc:
+            last_error = str(exc)
+
+        if time.monotonic() >= deadline:
+            break
+
+        time.sleep(1)
+
+    detail = (
+        f": {last_error}"
+        if last_error
+        else ""
+    )
+
+    LOG.warning(
+        "%s: не удалось подтвердить свежую запись "
+        "host-abort за %d сек%s",
+        disk.label,
+        settle_seconds,
+        detail,
+    )
+
+    return False
 
 
 def read_selftest_log(disk: Disk, general: dict[str, Any]) -> dict[str, Any]:
@@ -1368,6 +1693,7 @@ def run_selftests(
                         if stopped:
                             result.outcome = SelfTestOutcome.TIMEOUT_ABORTED
                             result.detail = timeout_detail + "; тест остановлен"
+                            remember_owned_timeout_abort(item, general)
                         else:
                             result.outcome = SelfTestOutcome.TIMEOUT_ABORT_FAILED
                             result.detail = timeout_detail + "; остановить тест не удалось"
